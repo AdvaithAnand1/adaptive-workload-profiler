@@ -1,0 +1,6 @@
+numpy
+psutil
+torch
+pandas
+scikit-learn
+keyboard

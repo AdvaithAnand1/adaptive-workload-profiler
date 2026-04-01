@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
+env/
+Fuck/
+
+# Model artifacts and local data captures
+model.pth
+classes.json
+training_data.csv
+outputs/
+
+# Notebook junk
+.ipynb_checkpoints/

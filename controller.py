@@ -10,9 +10,9 @@ Requirements:
 
 import json
 import time
+from pathlib import Path
 
 import keyboard  # global hotkeys; may require admin on Windows
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -35,18 +35,37 @@ PROFILE_HOTKEYS = {
 
 POLL_INTERVAL = 0.5      # seconds between predictions
 STABILITY_WINDOW = 5     # require N consistent predictions before switching
+CONFIDENCE_MIN = 0.55
+CONFIDENCE_MARGIN = 0.10
+MIN_SWITCH_INTERVAL = 8.0
 
 
 def load_model():
+    model_path = Path(MODEL_FILE)
+    classes_path = Path(CLASSES_FILE)
+    if not model_path.exists() or not classes_path.exists():
+        raise RuntimeError(
+            "Missing model artifacts. Expected both "
+            f"'{MODEL_FILE}' and '{CLASSES_FILE}'. "
+            "Run train_model.py after collecting training_data.csv."
+        )
+
     with open(CLASSES_FILE, "r", encoding="utf-8") as f:
         classes = json.load(f)
+    if not classes:
+        raise RuntimeError(f"'{CLASSES_FILE}' is empty; retrain the model.")
 
     input_dim = len(FEATURE_NAMES)
     num_classes = len(classes)
 
     model = SystemStateNet(input_dim, num_classes)
     state = torch.load(MODEL_FILE, map_location="cpu")
-    model.load_state_dict(state)
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Model/feature schema mismatch. Re-record data and re-run train_model.py."
+        ) from e
     model.eval()
 
     return model, classes
@@ -69,6 +88,7 @@ def main_loop():
     current_label = None
     last_candidate = None
     stable_count = 0
+    last_switch_ts = 0.0
 
     print("Starting controller loop. Press Ctrl+C to stop.")
 
@@ -80,22 +100,46 @@ def main_loop():
             with torch.inference_mode():
                 logits = model(x_t)
                 probs = F.softmax(logits, dim=1)
-                idx = int(probs.argmax(dim=1).item())
+                topk = probs.topk(k=min(2, probs.shape[1]), dim=1)
+                idx = int(topk.indices[0, 0].item())
                 pred_label = classes[idx]
+                confidence = float(topk.values[0, 0].item())
+                runner_up = (
+                    float(topk.values[0, 1].item())
+                    if topk.values.shape[1] > 1
+                    else 0.0
+                )
 
-            # Simple hysteresis: require STABILITY_WINDOW consistent predictions
-            if pred_label == last_candidate:
-                stable_count += 1
+            margin = confidence - runner_up
+            confident = (
+                confidence >= CONFIDENCE_MIN and margin >= CONFIDENCE_MARGIN
+            )
+
+            # Hysteresis only when confidence/margin are strong enough.
+            if confident:
+                if pred_label == last_candidate:
+                    stable_count += 1
+                else:
+                    last_candidate = pred_label
+                    stable_count = 1
             else:
-                last_candidate = pred_label
-                stable_count = 1
+                last_candidate = None
+                stable_count = 0
 
-            if stable_count >= STABILITY_WINDOW and pred_label != current_label:
+            can_switch = (time.time() - last_switch_ts) >= MIN_SWITCH_INTERVAL
+            if (
+                confident
+                and stable_count >= STABILITY_WINDOW
+                and pred_label != current_label
+                and can_switch
+            ):
                 current_label = pred_label
                 send_profile_hotkey(current_label)
+                last_switch_ts = time.time()
 
             print(
-                f"pred={pred_label:<10} stable={stable_count:<2} current={current_label}",
+                f"pred={pred_label:<10} conf={confidence:.2f} margin={margin:.2f} "
+                f"stable={stable_count:<2} current={current_label} confident={confident}",
                 end="\r",
                 flush=True,
             )
