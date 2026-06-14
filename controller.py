@@ -1,14 +1,17 @@
 # controller.py
 """
-Run the trained model in a loop and switch G-Helper profiles via hotkeys.
+Run the trained model in a loop and apply workload-driven profiles.
 
-Requirements:
-    pip install keyboard
-    - G-Helper running
-    - G-Helper hotkeys enabled for Silent/Balanced/Turbo
+Default path:
+    - direct G-Helper-compatible hotkeys from config.profile_hotkeys
+
+Optional shared backend path:
+    - set PERFANALYZE_CONTROLLER_USE_ORACLE=1, or configure PERFANALYZE_ORACLE_BACKEND / PERFANALYZE_ORACLE_COMMAND
+    - this lets controller use the same command/powercfg/oracle backend flow as the demo GUI and probe tools
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -16,29 +19,15 @@ import keyboard  # global hotkeys; may require admin on Windows
 import torch
 import torch.nn.functional as F
 
+from config import CONFIG_FILE, load_config
 from model import SystemStateNet
 from monitor import get_telemetry, FEATURE_NAMES
+from oracle_client import OracleClient, profile_for_label
+from prediction_logic import ProbabilitySmoother, summarize_probabilities
+from switch_policy import describe_gate, evaluate_switch_gate
 
 MODEL_FILE = "model.pth"
 CLASSES_FILE = "classes.json"
-
-# Map workload label -> G-Helper hotkey combo
-# Adjust keys to match your actual G-Helper setup
-PROFILE_HOTKEYS = {
-    "idle": "ctrl+shift+alt+f16",       # Silent
-    "light": "ctrl+shift+alt+f17",      # Balanced
-    "browsing": "ctrl+shift+alt+f17",   # Balanced
-    "gaming": "ctrl+shift+alt+f18",     # Turbo
-    "rendering": "ctrl+shift+alt+f18",  # Turbo
-    "heavy": "ctrl+shift+alt+f18",      # Turbo
-}
-
-POLL_INTERVAL = 0.5      # seconds between predictions
-STABILITY_WINDOW = 5     # require N consistent predictions before switching
-CONFIDENCE_MIN = 0.55
-CONFIDENCE_MARGIN = 0.10
-MIN_SWITCH_INTERVAL = 8.0
-
 
 def load_model():
     model_path = Path(MODEL_FILE)
@@ -71,24 +60,65 @@ def load_model():
     return model, classes
 
 
-def send_profile_hotkey(label: str):
-    combo = PROFILE_HOTKEYS.get(label)
+def send_profile_hotkey(profile: str, profile_hotkeys: dict[str, str]) -> bool:
+    combo = profile_hotkeys.get(profile.strip().lower())
     if not combo:
-        print(f"[WARN] No hotkey mapping for label='{label}'")
-        return
-    print(f"[ACTION] Switching profile mapped from '{label}' via {combo}")
+        print(f"[WARN] No hotkey mapping for profile='{profile}'")
+        return False
+    print(f"[ACTION] Switching profile='{profile}' via hotkey '{combo}'")
     keyboard.send(combo)
+    return True
+
+
+def _use_oracle_backend() -> bool:
+    token = os.getenv("PERFANALYZE_CONTROLLER_USE_ORACLE", "").strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if os.getenv("PERFANALYZE_ORACLE_COMMAND", "").strip():
+        return True
+    requested = os.getenv("PERFANALYZE_ORACLE_BACKEND", "").strip().lower()
+    return requested in {"auto", "command", "oracle_command", "command_bridge", "oracle_module", "external", "powercfg", "windows_powercfg"}
+
+
+def apply_profile_action(
+    profile: str,
+    *,
+    profile_hotkeys: dict[str, str],
+    oracle: OracleClient | None,
+) -> tuple[bool, str]:
+    if oracle is not None:
+        result = oracle.set_profile(profile)  # controller is live; no dry-run path here
+        return result.ok, result.message
+
+    switched = send_profile_hotkey(profile, profile_hotkeys=profile_hotkeys)
+    return switched, "direct hotkey" if switched else "direct hotkey failed"
 
 
 def main_loop():
+    try:
+        cfg_result = load_config(CONFIG_FILE)
+    except RuntimeError as e:
+        print(f"[CONFIG ERROR] {e}")
+        return
+
+    cfg = cfg_result.config
+    print(f"[CONFIG] Loaded: {cfg_result.source}")
+
     model, classes = load_model()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    current_label = None
+    oracle = OracleClient() if _use_oracle_backend() else None
+    if oracle is not None:
+        print(f"[BACKEND] Using oracle backend: {oracle.backend_name}")
+    else:
+        print("[BACKEND] Using direct hotkey switching")
+
+    current_profile = None
     last_candidate = None
     stable_count = 0
     last_switch_ts = 0.0
+    smoother = ProbabilitySmoother(cfg.switching.probability_ema_alpha)
 
     print("Starting controller loop. Press Ctrl+C to stop.")
 
@@ -100,19 +130,18 @@ def main_loop():
             with torch.inference_mode():
                 logits = model(x_t)
                 probs = F.softmax(logits, dim=1)
-                topk = probs.topk(k=min(2, probs.shape[1]), dim=1)
-                idx = int(topk.indices[0, 0].item())
-                pred_label = classes[idx]
-                confidence = float(topk.values[0, 0].item())
-                runner_up = (
-                    float(topk.values[0, 1].item())
-                    if topk.values.shape[1] > 1
-                    else 0.0
-                )
 
-            margin = confidence - runner_up
+            raw_summary = summarize_probabilities(probs[0], classes)
+            smoothed_probs = smoother.update(probs[0])
+            decision_summary = summarize_probabilities(smoothed_probs, classes)
+
+            pred_label = decision_summary.label
+            confidence = decision_summary.confidence
+            runner_up = decision_summary.runner_up_confidence
+            margin = decision_summary.margin
             confident = (
-                confidence >= CONFIDENCE_MIN and margin >= CONFIDENCE_MARGIN
+                confidence >= cfg.switching.confidence_min
+                and margin >= cfg.switching.confidence_margin
             )
 
             # Hysteresis only when confidence/margin are strong enough.
@@ -126,24 +155,44 @@ def main_loop():
                 last_candidate = None
                 stable_count = 0
 
-            can_switch = (time.time() - last_switch_ts) >= MIN_SWITCH_INTERVAL
-            if (
-                confident
-                and stable_count >= STABILITY_WINDOW
-                and pred_label != current_label
-                and can_switch
-            ):
-                current_label = pred_label
-                send_profile_hotkey(current_label)
-                last_switch_ts = time.time()
+            target_profile = profile_for_label(
+                pred_label,
+                label_map=cfg.label_to_profile,
+            )
+            gate = evaluate_switch_gate(
+                current_profile=current_profile,
+                target_profile=target_profile,
+                confident=confident,
+                stable_count=stable_count,
+                base_window=cfg.switching.stability_window,
+                downshift_extra_window=cfg.switching.downshift_extra_window,
+                now_ts=time.time(),
+                last_switch_ts=last_switch_ts,
+                min_switch_interval_sec=cfg.switching.min_switch_interval_sec,
+                downshift_hold_sec=cfg.switching.downshift_hold_sec,
+            )
+            if gate.allow:
+                switched, action_message = apply_profile_action(
+                    target_profile,
+                    profile_hotkeys=cfg.profile_hotkeys,
+                    oracle=oracle,
+                )
+                if switched:
+                    current_profile = target_profile
+                    last_switch_ts = time.time()
+                else:
+                    print(f"[WARN] Failed to apply profile='{target_profile}': {action_message}")
 
             print(
-                f"pred={pred_label:<10} conf={confidence:.2f} margin={margin:.2f} "
-                f"stable={stable_count:<2} current={current_label} confident={confident}",
+                f"raw={raw_summary.label:<10} raw_conf={raw_summary.confidence:.2f} "
+                f"decision={pred_label:<10} conf={confidence:.2f} margin={margin:.2f} "
+                f"stable={stable_count:<2} target={target_profile:<11} "
+                f"current={current_profile} backend={oracle.backend_name if oracle else 'hotkey'} "
+                f"gate={describe_gate(gate):<28} confident={confident}",
                 end="\r",
                 flush=True,
             )
-            time.sleep(POLL_INTERVAL)
+            time.sleep(cfg.switching.poll_interval_sec)
 
     except KeyboardInterrupt:
         print("\nController stopped.")

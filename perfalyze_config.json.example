@@ -1,0 +1,25 @@
+{
+  "switching": {
+    "poll_interval_sec": 0.5,
+    "stability_window": 5,
+    "confidence_min": 0.55,
+    "confidence_margin": 0.1,
+    "min_switch_interval_sec": 8.0,
+    "probability_ema_alpha": 0.45,
+    "downshift_extra_window": 2,
+    "downshift_hold_sec": 10.0
+  },
+  "label_to_profile": {
+    "idle": "silent",
+    "light": "balanced",
+    "browsing": "balanced",
+    "gaming": "performance",
+    "rendering": "performance",
+    "heavy": "performance"
+  },
+  "profile_hotkeys": {
+    "silent": "ctrl+shift+alt+f16",
+    "balanced": "ctrl+shift+alt+f17",
+    "performance": "ctrl+shift+alt+f18"
+  }
+}

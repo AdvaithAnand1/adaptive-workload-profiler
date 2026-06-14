@@ -6,13 +6,13 @@ __pycache__/
 .venv/
 venv/
 env/
-Fuck/
 
 # Model artifacts and local data captures
 model.pth
 classes.json
 training_data.csv
 outputs/
+run_logs/
 
 # Notebook junk
 .ipynb_checkpoints/

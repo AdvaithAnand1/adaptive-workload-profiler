@@ -253,25 +253,61 @@ def _use_mock_mode() -> bool:
     }
 
 
+def _active_mock_label(now_s: float) -> str:
+    raw = os.getenv("PERFANALYZE_MOCK_LABEL", "").strip().lower()
+    if raw in {"idle", "light", "heavy"}:
+        return raw
+
+    # Probe mode fallback: cycle through labels when no explicit label is set.
+    cycle_len = 45.0
+    phase = now_s % (cycle_len * 3.0)
+    if phase < cycle_len:
+        return "idle"
+    if phase < 2.0 * cycle_len:
+        return "light"
+    return "heavy"
+
+
 def _mock_features() -> np.ndarray:
     t = time.time()
-    cpu_usage = 35.0 + 25.0 * np.sin(t / 6.0)
-    cpu_ema = 35.0 + 22.0 * np.sin((t - 1.8) / 6.0)
-    core_std = 5.0 + 18.0 * abs(np.sin(t / 4.0))
-    core_std_ema = 5.5 + 15.0 * abs(np.sin((t - 2.2) / 4.0))
-    user_pct = max(0.0, cpu_usage * 0.75)
-    sys_pct = max(0.0, cpu_usage * 0.20)
-    ctx = 14000.0 + 4500.0 * abs(np.sin(t / 3.0))
-    intr = 3800.0 + 1800.0 * abs(np.sin(t / 5.0))
-    ram_pct = 50.0 + 8.0 * abs(np.sin(t / 8.0))
-    ram_avail_mb = 12000.0 - 85.0 * ram_pct
-    disk_r = 0.8 + 28.0 * abs(np.sin(t / 7.0))
-    disk_w = 0.6 + 18.0 * abs(np.sin(t / 5.5))
-    net_d = 10.0 + 420.0 * abs(np.sin(t / 9.0))
-    net_u = 4.0 + 120.0 * abs(np.sin(t / 9.0 + 0.8))
-    proc_count = 210.0 + 35.0 * abs(np.sin(t / 25.0))
-    freq_mhz = 1700.0 + 28.0 * cpu_usage
-    freq_ratio = min(100.0, max(0.0, freq_mhz / 45.0))
+    label = _active_mock_label(t)
+
+    if label == "idle":
+        cpu_mid, cpu_amp = 12.0, 6.0
+        disk_mid, disk_amp = 0.4, 1.5
+        net_mid, net_amp = 25.0, 70.0
+        ram_mid, ram_amp = 38.0, 4.0
+        proc_mid, proc_amp = 165.0, 12.0
+    elif label == "light":
+        cpu_mid, cpu_amp = 35.0, 12.0
+        disk_mid, disk_amp = 4.5, 8.0
+        net_mid, net_amp = 180.0, 230.0
+        ram_mid, ram_amp = 52.0, 6.0
+        proc_mid, proc_amp = 220.0, 20.0
+    else:  # heavy
+        cpu_mid, cpu_amp = 78.0, 12.0
+        disk_mid, disk_amp = 35.0, 20.0
+        net_mid, net_amp = 420.0, 260.0
+        ram_mid, ram_amp = 71.0, 7.0
+        proc_mid, proc_amp = 280.0, 28.0
+
+    cpu_usage = cpu_mid + cpu_amp * np.sin(t / 4.8)
+    cpu_ema = cpu_mid + (cpu_amp * 0.85) * np.sin((t - 1.4) / 4.8)
+    core_std = 2.0 + (cpu_amp * 0.35) + 6.0 * abs(np.sin(t / 4.0))
+    core_std_ema = core_std * 0.92 + 1.0 * abs(np.sin((t - 2.2) / 4.0))
+    user_pct = max(0.0, cpu_usage * 0.74)
+    sys_pct = max(0.0, cpu_usage * 0.22)
+    ctx = 4200.0 + (cpu_usage * 230.0) + 900.0 * abs(np.sin(t / 3.0))
+    intr = 1600.0 + (cpu_usage * 55.0) + 500.0 * abs(np.sin(t / 5.0))
+    ram_pct = ram_mid + ram_amp * abs(np.sin(t / 8.0))
+    ram_avail_mb = 13000.0 - 92.0 * ram_pct
+    disk_r = disk_mid + disk_amp * abs(np.sin(t / 7.0))
+    disk_w = (disk_mid * 0.8) + (disk_amp * 0.7) * abs(np.sin(t / 5.5))
+    net_d = net_mid + net_amp * abs(np.sin(t / 9.0))
+    net_u = (net_mid * 0.28) + (net_amp * 0.26) * abs(np.sin(t / 9.0 + 0.8))
+    proc_count = proc_mid + proc_amp * abs(np.sin(t / 25.0))
+    freq_mhz = 1350.0 + 35.0 * cpu_usage
+    freq_ratio = min(100.0, max(0.0, freq_mhz / 42.0))
     on_battery = 0.0
     power_saver = 0.0
     phys, logical = _core_counts()

@@ -10,6 +10,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -105,6 +106,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main():
     args = _build_arg_parser().parse_args()
     if args.cycles <= 0:
@@ -125,9 +130,13 @@ def main():
         print(f"  {i}. {label} for {duration:.1f}s")
 
     total = len(sessions)
+    use_mock = _truthy_env("PERFANALYZE_MOCK")
+    prior_mock_label = os.getenv("PERFANALYZE_MOCK_LABEL")
     for i, (label, duration) in enumerate(sessions, start=1):
         print(f"\n[{i}/{total}] Prepare workload: '{label}'")
         _countdown(args.countdown)
+        if use_mock:
+            os.environ["PERFANALYZE_MOCK_LABEL"] = label.strip().lower()
         record(
             label=label,
             out_csv=args.out,
@@ -138,6 +147,12 @@ def main():
         if i < total and args.cooldown > 0:
             print(f"Cooldown for {args.cooldown:.1f}s...")
             time.sleep(args.cooldown)
+
+    if use_mock:
+        if prior_mock_label is None:
+            os.environ.pop("PERFANALYZE_MOCK_LABEL", None)
+        else:
+            os.environ["PERFANALYZE_MOCK_LABEL"] = prior_mock_label
 
     print(f"\nFinished. Dataset saved to '{args.out}'.")
 
