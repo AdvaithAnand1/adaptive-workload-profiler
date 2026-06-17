@@ -30,9 +30,10 @@ WORKLOAD_TO_PROFILE: dict[str, Profile] = {
 }
 
 POWERCFG_ALIAS_BY_PROFILE: dict[Profile, str] = {
-    "silent": "SCHEME_MIN",
+    # Windows names these aliases by performance level, not power usage.
+    "silent": "SCHEME_MAX",
     "balanced": "SCHEME_BALANCED",
-    "performance": "SCHEME_MAX",
+    "performance": "SCHEME_MIN",
 }
 
 _POWERCFG_SUBGROUP_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"

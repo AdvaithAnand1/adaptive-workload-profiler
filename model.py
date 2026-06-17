@@ -1,10 +1,12 @@
 # model.py
 """
-Simple feed-forward network to classify system state from telemetry.
+Simple feed-forward network to classify system state from telemetry only.
 """
 
 import torch
 import torch.nn as nn
+
+MODEL_NAME = "SystemStateNet"
 
 
 class SystemStateNet(nn.Module):

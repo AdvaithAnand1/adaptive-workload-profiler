@@ -10,7 +10,11 @@ env/
 # Model artifacts and local data captures
 model.pth
 classes.json
+model_metadata.json
 training_data.csv
+data/
+models/
+power_plan_catalog.json
 outputs/
 run_logs/
 

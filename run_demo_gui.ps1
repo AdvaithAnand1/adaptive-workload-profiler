@@ -1,5 +1,6 @@
 param(
     [switch]$Mock,
+    [switch]$Debug,
     [string]$PythonPath = ""
 )
 
@@ -11,6 +12,13 @@ if ($Mock) {
     Write-Host "[demo] PERFANALYZE_MOCK=1"
 } else {
     Remove-Item Env:PERFANALYZE_MOCK -ErrorAction SilentlyContinue
+}
+
+if ($Debug) {
+    $env:PERFANALYZE_DEBUG = "1"
+    Write-Host "[demo] PERFANALYZE_DEBUG=1"
+} else {
+    Remove-Item Env:PERFANALYZE_DEBUG -ErrorAction SilentlyContinue
 }
 
 if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {

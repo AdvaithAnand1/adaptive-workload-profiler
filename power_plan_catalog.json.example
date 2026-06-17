@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "plans": {
+    "quiet": {
+      "name": "PerfAnalyze Quiet",
+      "cpu_intent": 0,
+      "graphics_intent": 0,
+      "total_power_level": 0,
+      "enabled": true,
+      "base_scheme": "SCHEME_BALANCED",
+      "windows_guid": null,
+      "description": "Low-noise, low-power operation for idle workloads.",
+      "settings": {
+        "SUB_PROCESSOR/PROCTHROTTLEMAX": {"ac": 60, "dc": 45},
+        "SUB_PROCESSOR/PERFBOOSTMODE": {"ac": 0, "dc": 0},
+        "SUB_PROCESSOR/PERFEPP": {"ac": 75, "dc": 90},
+        "SUB_GRAPHICS/GPUPREFERENCEPOLICY": {"ac": 1, "dc": 1},
+        "SUB_PCIEXPRESS/ASPM": {"ac": 2, "dc": 2}
+      }
+    },
+    "everyday": {
+      "name": "PerfAnalyze Everyday",
+      "cpu_intent": 1,
+      "graphics_intent": 1,
+      "total_power_level": 1,
+      "enabled": true,
+      "base_scheme": "SCHEME_BALANCED",
+      "windows_guid": null,
+      "description": "Responsive general-purpose operation.",
+      "settings": {
+        "SUB_PROCESSOR/PROCTHROTTLEMAX": {"ac": 100, "dc": 85},
+        "SUB_PROCESSOR/PERFBOOSTMODE": {"ac": 1, "dc": 0},
+        "SUB_PROCESSOR/PERFEPP": {"ac": 35, "dc": 70},
+        "SUB_GRAPHICS/GPUPREFERENCEPOLICY": {"ac": 0, "dc": 1},
+        "SUB_PCIEXPRESS/ASPM": {"ac": 1, "dc": 2}
+      }
+    },
+    "cpu_focus": {
+      "name": "PerfAnalyze CPU Focus",
+      "cpu_intent": 4,
+      "graphics_intent": 1,
+      "total_power_level": 3,
+      "enabled": true,
+      "base_scheme": "SCHEME_BALANCED",
+      "windows_guid": null,
+      "description": "Prioritize CPU throughput while preserving package headroom.",
+      "settings": {
+        "SUB_PROCESSOR/PROCTHROTTLEMAX": {"ac": 100, "dc": 90},
+        "SUB_PROCESSOR/PERFBOOSTMODE": {"ac": 2, "dc": 1},
+        "SUB_PROCESSOR/PERFEPP": {"ac": 10, "dc": 35},
+        "SUB_GRAPHICS/GPUPREFERENCEPOLICY": {"ac": 1, "dc": 1},
+        "SUB_PCIEXPRESS/ASPM": {"ac": 1, "dc": 2}
+      }
+    },
+    "graphics_focus": {
+      "name": "PerfAnalyze Graphics Focus",
+      "cpu_intent": 2,
+      "graphics_intent": 4,
+      "total_power_level": 3,
+      "enabled": true,
+      "base_scheme": "SCHEME_BALANCED",
+      "windows_guid": null,
+      "description": "Prioritize graphics work using portable Windows controls.",
+      "settings": {
+        "SUB_PROCESSOR/PROCTHROTTLEMAX": {"ac": 85, "dc": 75},
+        "SUB_PROCESSOR/PERFBOOSTMODE": {"ac": 1, "dc": 0},
+        "SUB_PROCESSOR/PERFEPP": {"ac": 35, "dc": 60},
+        "SUB_GRAPHICS/GPUPREFERENCEPOLICY": {"ac": 0, "dc": 0},
+        "SUB_PCIEXPRESS/ASPM": {"ac": 0, "dc": 1}
+      }
+    },
+    "maximum_mixed": {
+      "name": "PerfAnalyze Maximum Mixed",
+      "cpu_intent": 4,
+      "graphics_intent": 4,
+      "total_power_level": 4,
+      "enabled": true,
+      "base_scheme": "SCHEME_BALANCED",
+      "windows_guid": null,
+      "description": "High CPU and graphics performance for mixed workloads.",
+      "settings": {
+        "SUB_PROCESSOR/PROCTHROTTLEMAX": {"ac": 100, "dc": 90},
+        "SUB_PROCESSOR/PERFBOOSTMODE": {"ac": 2, "dc": 1},
+        "SUB_PROCESSOR/PERFEPP": {"ac": 0, "dc": 25},
+        "SUB_GRAPHICS/GPUPREFERENCEPOLICY": {"ac": 0, "dc": 0},
+        "SUB_PCIEXPRESS/ASPM": {"ac": 0, "dc": 1}
+      }
+    }
+  },
+  "classification_to_plan": {
+    "idle": "quiet",
+    "light": "everyday",
+    "browsing": "everyday",
+    "compiling": "cpu_focus",
+    "cpu_rendering": "cpu_focus",
+    "gaming": "graphics_focus",
+    "gpu_rendering": "graphics_focus",
+    "heavy": "maximum_mixed",
+    "rendering": "maximum_mixed"
+  }
+}

@@ -29,10 +29,12 @@ py -3.12 -m pip install -r requirements.txt
 ## Files
 
 - `monitor.py`: OS-native telemetry sampler + feature engineering.
-- `record.py`: Record labeled telemetry into `training_data.csv`.
+- `record.py`: Record one labeled telemetry CSV per session under `data/`.
 - `collect_dataset.py`: Run a multi-label timed collection plan in one command.
 - `model.py`: `SystemStateNet` model definition.
-- `train_model.py`: Train model and export `model.pth` + `classes.json`.
+- `model_artifacts.py`: Load normalized runtime bundles and validate model metadata.
+- `train_model.py`: Train from all session CSVs and export versioned models.
+- `training_gui.py`: Separate training tool for app-guided labeling and collection approval.
 - `controller.py`: Live inference loop and profile-switch hotkeys.
 - `oracle_client.py`: Minimal oracle adapter (`silent|balanced|performance`) with demo fallback.
 - `demo_gui.py`: GUI demo of telemetry -> prediction -> target profile -> oracle action.
@@ -41,8 +43,14 @@ py -3.12 -m pip install -r requirements.txt
 - `tune_probe_config.py`: Turn probe evidence into recommended switching config changes.
 - `analyze_training_data.py`: Inspect label/session/power-saver coverage before retraining.
 - `inspect_oracle_backend.py`: Inspect backend selection and discovered power-plan mappings.
+- `inspect_power_settings.py`: Read-only discovery of portable Windows power settings.
+- `power_plan_cli.py`: Inspect catalogs and Windows support, and preview managed commands.
+- `preview_power_plan.py`: Render managed-plan commands without executing them.
+- `powerplans/`: Plan models, persistence, discovery, and safe command generation.
+- `POWER_PLANS_BACKEND.md`: Backend and persistence contract for GUI integration.
+- `power_plan_catalog.json.example`: Initial unlimited-plan catalog and mappings.
 
-## Feature Schema (`os_native_v2`)
+## Feature Schema (`os_native_v3`)
 
 Training and inference use the same fixed-order datapoints from `monitor.FEATURE_NAMES`:
 
@@ -67,8 +75,20 @@ Training and inference use the same fixed-order datapoints from `monitor.FEATURE
 19. `Power Saver [0/1]`
 20. `CPU Physical Cores`
 21. `CPU Logical Cores`
+22. `GPU Usage [%]`
+23. `GPU 3D Usage [%]`
+24. `GPU Compute Usage [%]`
+25. `GPU Video Usage [%]`
+26. `GPU Copy Usage [%]`
+27. `GPU Dedicated Memory [MB]`
+28. `GPU Shared Memory [MB]`
+29. `GPU Available [0/1]`
 
-Each `record.py` run now writes a `session_id` column, so training can validate with session-aware splits.
+GPU data comes from Windows performance counters and is sampled in the
+background. Each `record.py` run writes a separate session file so training can
+keep complete sessions isolated between train and test sets. The shipping
+model is normalized at train time and loaded with matching metadata; old raw
+artifacts are rejected and must be retrained.
 
 ## Run
 
@@ -76,24 +96,29 @@ Each `record.py` run now writes a `session_id` column, so training can validate 
 
 ```bash
 python record.py idle --interval 0.25 --duration 180
-python record.py light --interval 0.25 --duration 180
-python record.py heavy --interval 0.25 --duration 240
+python record.py youtube_1080p --interval 0.25 --duration 300
+python record.py gaming --interval 0.25 --duration 300
 ```
 
 Or run one collection plan:
 
 ```bash
-python collect_dataset.py --sessions idle:180,light:180,heavy:240 --interval 0.25 --cycles 2 --reset
+python collect_dataset.py --sessions idle:180,youtube_1080p:300,gaming:300 --interval 0.25 --cycles 2
 ```
 
 Data quality tip:
-- For each label, collect examples with power saver ON and OFF so the model learns workload intent instead of power-plan side effects.
+- Record at least two separate sessions per label, across different power and
+  workload configurations.
 
 2. Train model:
 
 ```bash
 python train_model.py
 ```
+
+Training starts from fresh weights, recursively combines every CSV under
+`data/`, splits by whole sessions, saves a version under `models/`, refreshes the
+root runtime artifacts, and prints only final test accuracy.
 
 3. Run controller:
 
@@ -119,21 +144,53 @@ Optional mock telemetry mode:
 .\run_demo_gui.ps1 -Mock
 ```
 
+Training-only app policies live in a separate tool:
+
+```bash
+python training_gui.py
+```
+
+That tool can propose labels from local foreground process context, but those
+rules are not used by production inference and are not bundled into exported
+model artifacts.
+
 Ollama control GUI (start/stop server, prompt panel, live monitoring):
 
 ```powershell
 .\run_ollama_control_gui.ps1
 ```
 
-The GUI uses a tabbed layout to keep the live dashboard, runtime controls, configuration, and event log separated.
-That keeps the log available without making the whole app feel like a console window.
+The normal GUI has two tabs: Dashboard for live state and controls, and Power
+Plans for catalog editing. Diagnostics are hidden by default and available in
+debug mode:
+
+```powershell
+.\run_demo_gui.ps1 -Debug
+```
 
 The dashboard is organized around:
-- recommendation + readiness
-- a compact snapshot row (target, applied, gate, last action)
-- actuation status (what backend/profile action happened)
-- session outcomes (auto/manual/failed actions + dominant blocks)
 - telemetry and inference detail
+- confidence and stability meters
+- start/stop, dry-run, and manual profile controls
+
+### Power Plans Editor
+
+The `Power Plans` tab is a catalog editor for unlimited multidimensional plans.
+It provides:
+
+- a scrollable plan list with a fixed Add button
+- a per-plan `...` menu for removing a plan from the draft
+- independent CPU intent, GPU intent, and total power level fields
+- base scheme, read-only backend-managed Windows GUID, enabled state,
+  description, and mapping summary
+- AC and battery values generated from `PORTABLE_SETTING_SPECS`
+- read-only support discovery for the current machine
+
+`Save Catalog` writes `power_plan_catalog.json`. The editor does not create,
+modify, activate, or delete Windows power schemes. Adding future CPU, iGPU,
+platform, or AMD parameters to the setting catalog automatically adds rows to
+the editor without changing its layout code. Removing a mapped plan requires
+confirmation and reports the classification mappings that will be removed.
 
 ## OpenClaw Prompt Launcher
 
@@ -211,9 +268,9 @@ Useful environment overrides:
 ```powershell
 $env:PERFANALYZE_ORACLE_BACKEND="auto"       # auto | command | oracle_module | powercfg | demo
 $env:PERFANALYZE_ORACLE_COMMAND="python oracle_command_mock.py"
-$env:PERFANALYZE_POWERCFG_SILENT="SCHEME_MIN"
+$env:PERFANALYZE_POWERCFG_SILENT="SCHEME_MAX"
 $env:PERFANALYZE_POWERCFG_BALANCED="SCHEME_BALANCED"
-$env:PERFANALYZE_POWERCFG_PERFORMANCE="SCHEME_MAX"
+$env:PERFANALYZE_POWERCFG_PERFORMANCE="SCHEME_MIN"
 
 # Optional generic Windows tuning knobs for the powercfg fallback
 $env:PERFANALYZE_POWERCFG_SILENT_MAX_CPU="60"
@@ -260,6 +317,113 @@ Inspect the current backend choice and discovered power plans:
 ```bash
 python inspect_oracle_backend.py
 ```
+
+## CPU/Graphics Power-Plan Foundation
+
+PerfAnalyze is moving from a fixed Silent/Balanced/Performance ladder to an
+unlimited catalog of named plans. Each plan has independent:
+
+- CPU intent (`0-4`)
+- graphics intent (`0-4`)
+- total power level (`0-4`) for switch safety and cooldown decisions
+- AC and DC values for any discovered Windows power setting
+- stable PerfAnalyze plan id plus an optional generated Windows scheme GUID
+
+The initial templates are:
+
+- `quiet`
+- `everyday`
+- `cpu_focus`
+- `graphics_focus`
+- `maximum_mixed`
+
+The default plans intentionally use only five high-impact Windows-defined
+controls:
+
+- maximum processor state
+- processor boost mode
+- processor energy-performance preference
+- Windows GPU preference policy
+- PCI Express link-state power management
+
+Not every machine exposes every control. PerfAnalyze discovers support first
+and omits unavailable fields rather than substituting vendor-specific commands.
+
+Default AC/DC values:
+
+| Plan | CPU max | Boost | EPP | GPU policy | PCIe policy |
+|---|---|---|---|---|---|
+| Quiet | 60 / 45 | Disabled / Disabled | 75 / 90 | Low power / Low power | Maximum savings / Maximum savings |
+| Everyday | 100 / 85 | Enabled / Disabled | 35 / 70 | None / Low power | Moderate / Maximum savings |
+| CPU Focus | 100 / 90 | Aggressive / Enabled | 10 / 35 | Low power / Low power | Moderate / Maximum savings |
+| Graphics Focus | 85 / 75 | Enabled / Disabled | 35 / 60 | None / None | Off / Moderate |
+| Maximum Mixed | 100 / 90 | Aggressive / Enabled | 0 / 25 | None / None | Off / Moderate |
+
+Each pair is `AC / battery`. Lower EPP values favor CPU performance; higher
+values favor efficiency. Windows GPU policy has no cross-vendor "maximum GPU"
+setting, so graphics-focused plans remove the low-power preference and reduce
+PCIe link savings instead of pretending to control clocks or wattage.
+
+Classifications map to one plan id, and multiple classifications may share the
+same plan. The schema is shown in `power_plan_catalog.json.example`.
+
+Discover the settings available on the current machine:
+
+```bash
+python inspect_power_settings.py
+python inspect_power_settings.py --all
+python inspect_power_settings.py --json
+```
+
+This discovery path is read-only. Saved plans accept only standard Windows
+setting aliases for processor behavior, cooling, graphics preference, and PCI
+Express link-state power management. Each setting is shown only when the current
+machine reports support. Vendor extension groups may appear under `--all`, but
+they are not saved or applied by the portable plan system.
+
+The Windows graphics controls are policy-level controls. They do not promise
+direct GPU clocks, voltages, or vendor-specific power limits. The GUI monitor
+recommends named catalog plans; it does not activate them until managed
+deployment has an explicit, user-confirmed integration path.
+
+### Managed-Plan Command Safety
+
+Use the unified backend terminal interface for catalog inspection, read-only
+Windows discovery, and command previews:
+
+```bash
+python power_plan_cli.py catalog init
+python power_plan_cli.py plans list
+python power_plan_cli.py plans show graphics_focus
+python power_plan_cli.py mappings
+python power_plan_cli.py windows schemes
+python power_plan_cli.py windows settings
+python power_plan_cli.py --catalog power_plan_catalog.json.example status
+python power_plan_cli.py --catalog power_plan_catalog.json.example preview create cpu_focus
+```
+
+`catalog init` only writes `power_plan_catalog.json`. The `windows` commands run
+read-only `powercfg` discovery, and every `preview` command prints the proposed
+command sequence without executing it. This CLI intentionally has no apply or
+execute subcommand. `preview_power_plan.py` remains as a smaller compatibility
+wrapper for create previews.
+
+The managed-plan service is dry-run-first:
+
+- `PowerCfgExecutor()` never starts a subprocess.
+- Real mutation requires both `dry_run=False` and `allow_mutation=True`.
+- Plan deletion additionally requires `allow_destructive=True`.
+- Create and update operations never activate a plan implicitly.
+- Existing schemes are updated or deleted only when their Windows name carries
+  the `PerfAnalyze` ownership prefix.
+- Active managed schemes cannot be updated or deleted by default.
+- Unsupported settings are skipped with warnings instead of sending unknown
+  values to the machine.
+
+For future opt-in integration tests, `temporary_activation(...)` captures both
+the active plan name and GUID, activates the requested scheme, and restores the
+captured GUID from a `finally` block even when the test body raises an error.
+There is currently no command-line option that enables real mutation.
 
 ## 20-Minute Functional Probe
 
@@ -311,8 +475,9 @@ python controller.py
 ## Configuration Notes
 
 - Default config path: `perfalyze_config.json`
-- The GUI can now load/save a different JSON config path when you want per-machine or per-experiment settings.
-- Saving to a new nested config path will create parent folders automatically.
+- The legacy runtime config is still loaded for the current three-profile
+  controller, but its GUI editor has been removed.
+- Power-plan catalog edits are saved separately to `power_plan_catalog.json`.
 - `switching.probability_ema_alpha` smooths class probabilities before the app decides a target profile.
   - Lower values = steadier but slower reactions
   - Higher values = more responsive but more jitter-prone

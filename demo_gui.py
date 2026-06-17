@@ -7,6 +7,7 @@ This GUI now supports runtime configuration editing and persistence.
 from __future__ import annotations
 
 import json
+import os
 import time
 import tkinter as tk
 from collections import Counter
@@ -24,11 +25,24 @@ from config import (
     load_config,
     write_config,
 )
-from model import SystemStateNet
-from monitor import FEATURE_NAMES, get_telemetry
-from oracle_client import OracleClient, Profile, profile_for_label
+from model_artifacts import load_model_artifacts, normalize_features
+from adaptive import PolicyObservationTracker
+from adaptive.models import TelemetrySnapshot
+from monitor import FEATURE_NAMES, get_runtime_context, get_telemetry
+from oracle_client import OracleClient, Profile
+from powerplans.editor import PowerPlansEditor
+from powerplans.store import load_power_plan_catalog
 from prediction_logic import ProbabilitySmoother, summarize_probabilities
-from switch_policy import describe_gate, evaluate_switch_gate
+from ui_theme import (
+    APP_BG,
+    BORDER,
+    MUTED,
+    SURFACE,
+    SURFACE_ALT,
+    RoundedButton,
+    RoundedCard,
+    apply_google_theme,
+)
 
 MODEL_FILE = "model.pth"
 CLASSES_FILE = "classes.json"
@@ -69,43 +83,34 @@ PRESET_SWITCHING: dict[str, dict[str, float | int]] = {
 
 
 def load_model_and_classes():
-    model_path = Path(MODEL_FILE)
-    classes_path = Path(CLASSES_FILE)
-    if not model_path.exists() or not classes_path.exists():
-        raise RuntimeError(
-            "Missing model artifacts. Expected model.pth and classes.json."
-        )
-
-    with classes_path.open("r", encoding="utf-8") as f:
-        classes = json.load(f)
-    if not classes:
-        raise RuntimeError("classes.json is empty; retrain the model.")
-
-    model = SystemStateNet(len(FEATURE_NAMES), len(classes))
-    state = torch.load(model_path, map_location="cpu")
-    try:
-        model.load_state_dict(state)
-    except RuntimeError as e:
-        raise RuntimeError(
-            "Model/feature schema mismatch. Re-record data and re-run train_model.py."
-        ) from e
-    model.eval()
-    return model, classes
+    bundle = load_model_artifacts()
+    return bundle.model, bundle.classes, bundle
 
 
 class DemoApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        apply_google_theme(self.root)
         self.root.title("PerfAnalyze Demo")
-        self.root.geometry("1100x820")
+        self.root.geometry("1180x860")
+        self.root.minsize(960, 720)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.classes: list[str] = []
+        self.model_bundle = None
+        self.observation_tracker = PolicyObservationTracker()
 
         self.oracle = OracleClient()
+        self.plan_catalog = load_power_plan_catalog()
         self.running = False
         self.tick_count = 0
+        self.debug_mode = os.getenv("PERFANALYZE_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         self.current_profile: Profile | None = None
         self.last_candidate: str | None = None
@@ -140,6 +145,8 @@ class DemoApp:
         self.live_summary_var = tk.StringVar(
             value="label=- | target=- | conf=0.00 | margin=0.00 | reliable=False"
         )
+        self.observation_phase_var = tk.StringVar(value="phase=idle")
+        self.observation_status_var = tk.StringVar(value="battery=unknown | no completed window yet")
         self.health_var = tk.StringVar(value="model not loaded yet")
         self.path_status_var = tk.StringVar(value="Config path status: default path selected")
         self.hotkey_status_var = tk.StringVar(value="Hotkeys: waiting for configuration review")
@@ -157,7 +164,7 @@ class DemoApp:
         self.stability_var = tk.DoubleVar(value=0.0)
         self.stability_text_var = tk.StringVar(value="0/0")
         self.log_filter_var = tk.StringVar(value="All")
-
+        self.log_box: tk.Text | None = None
         self.poll_interval_var = tk.StringVar(value="")
         self.stability_window_var = tk.StringVar(value="")
         self.confidence_min_var = tk.StringVar(value="")
@@ -326,181 +333,74 @@ class DemoApp:
             self.startup_config_warning = str(e)
 
     def _build_ui(self):
-        root_frame = ttk.Frame(self.root, padding=10)
+        root_frame = ttk.Frame(self.root, padding=(18, 12))
         root_frame.pack(fill=tk.BOTH, expand=True)
 
         notebook = ttk.Notebook(root_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
 
-        dashboard_tab = ttk.Frame(notebook, padding=10)
-        controls_tab = ttk.Frame(notebook, padding=10)
-        settings_tab = ttk.Frame(notebook, padding=10)
-        log_tab = ttk.Frame(notebook, padding=10)
-
+        dashboard_tab = ttk.Frame(notebook, padding=(4, 18))
+        power_plans_tab = ttk.Frame(notebook, padding=(4, 18))
         notebook.add(dashboard_tab, text="Dashboard")
-        notebook.add(controls_tab, text="Controls")
-        notebook.add(settings_tab, text="Configuration")
-        notebook.add(log_tab, text="Diagnostics")
+        notebook.add(power_plans_tab, text="Power Plans")
 
-        badge_row = ttk.Frame(dashboard_tab)
-        badge_row.pack(fill=tk.X, pady=(0, 10))
+        live_card = RoundedCard(dashboard_tab, title="Live")
+        live_card.pack(fill=tk.X)
 
-        recommendation_frame = ttk.LabelFrame(dashboard_tab, text="Recommendation", padding=10)
-        recommendation_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(
-            recommendation_frame,
-            textvariable=self.recommendation_var,
-            justify=tk.LEFT,
-            wraplength=900,
-            font=("Segoe UI", 10, "bold"),
-        ).pack(anchor="w", fill=tk.X)
-        ttk.Label(
-            recommendation_frame,
-            textvariable=self.switch_gate_var,
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(anchor="w", fill=tk.X, pady=(4, 0))
-
-        snapshot_row = ttk.Frame(dashboard_tab)
-        snapshot_row.pack(fill=tk.X, pady=(0, 10))
-        snapshot_row.columnconfigure(0, weight=1)
-        snapshot_row.columnconfigure(1, weight=1)
-        snapshot_row.columnconfigure(2, weight=1)
-        snapshot_row.columnconfigure(3, weight=1)
-
-        for col_idx, (title, var) in enumerate([
-            ("Target", self.target_profile_card_var),
-            ("Applied", self.applied_profile_card_var),
-            ("Gate", self.gate_card_var),
-            ("Last Action", self.last_action_card_var),
-        ]):
-            card = ttk.LabelFrame(snapshot_row, text=title, padding=8)
-            card.grid(row=0, column=col_idx, sticky="nsew", padx=(0 if col_idx == 0 else 6, 0))
-            ttk.Label(
-                card,
-                textvariable=var,
-                justify=tk.LEFT,
-                wraplength=200,
-                font=("Segoe UI", 9, "bold") if col_idx < 2 else None,
-            ).pack(anchor="w", fill=tk.X)
-
-        summary_row = ttk.Frame(dashboard_tab)
-        summary_row.pack(fill=tk.X)
-        summary_row.columnconfigure(0, weight=1)
-        summary_row.columnconfigure(1, weight=1)
-
-        self.mode_badge = tk.Label(badge_row, textvariable=self.mode_badge_var, padx=10, pady=4)
-        self.mode_badge.pack(side=tk.LEFT, padx=(0, 8))
-        self.execution_badge = tk.Label(badge_row, textvariable=self.execution_badge_var, padx=10, pady=4)
-        self.execution_badge.pack(side=tk.LEFT, padx=(0, 8))
-        self.config_badge = tk.Label(badge_row, textvariable=self.config_badge_var, padx=10, pady=4)
-        self.config_badge.pack(side=tk.LEFT, padx=(0, 8))
-        self.model_badge = tk.Label(badge_row, textvariable=self.model_badge_var, padx=10, pady=4)
-        self.model_badge.pack(side=tk.LEFT)
-
-        system_frame = ttk.LabelFrame(summary_row, text="System", padding=10)
-        system_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        decision_frame = ttk.LabelFrame(summary_row, text="Decision Detail", padding=10)
-        decision_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-
-        system_grid = ttk.Frame(system_frame)
-        system_grid.pack(fill=tk.X)
-        system_grid.columnconfigure(1, weight=1)
-        for row_idx, (label, var) in enumerate([
-            ("Status", self.status_var),
-            ("Model", self.model_info_var),
-            ("Config", self.config_var),
-            ("Health", self.health_var),
-        ]):
-            ttk.Label(system_grid, text=label).grid(
-                row=row_idx,
-                column=0,
-                sticky="nw",
-                padx=(0, 10),
-                pady=2,
-            )
-            ttk.Label(
-                system_grid,
-                textvariable=var,
-                justify=tk.LEFT,
-                wraplength=420,
-            ).grid(row=row_idx, column=1, sticky="w", pady=2)
-
-        decision_grid = ttk.Frame(decision_frame)
-        decision_grid.pack(fill=tk.X)
-        decision_grid.columnconfigure(1, weight=1)
-        for row_idx, (label, var) in enumerate([
-            ("State", self.profile_var),
-            ("Signal", self.live_summary_var),
-            ("Policy", self.config_summary_var),
-        ]):
-            ttk.Label(decision_grid, text=label).grid(
-                row=row_idx,
-                column=0,
-                sticky="nw",
-                padx=(0, 10),
-                pady=2,
-            )
-            ttk.Label(
-                decision_grid,
-                textvariable=var,
-                justify=tk.LEFT,
-                wraplength=420,
-            ).grid(row=row_idx, column=1, sticky="w", pady=2)
-
-        outcomes_row = ttk.Frame(dashboard_tab)
-        outcomes_row.pack(fill=tk.X, pady=(10, 0))
-        outcomes_row.columnconfigure(0, weight=1)
-        outcomes_row.columnconfigure(1, weight=1)
-
-        actuation_frame = ttk.LabelFrame(outcomes_row, text="Actuation", padding=10)
-        actuation_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        session_frame = ttk.LabelFrame(outcomes_row, text="Session", padding=10)
-        session_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-
-        ttk.Label(
-            actuation_frame,
-            textvariable=self.actuation_var,
-            justify=tk.LEFT,
-            wraplength=420,
-        ).pack(anchor="w", fill=tk.X)
-        ttk.Label(
-            session_frame,
-            textvariable=self.session_stats_var,
-            justify=tk.LEFT,
-            wraplength=420,
-        ).pack(anchor="w", fill=tk.X)
-
-        live_frame = ttk.LabelFrame(dashboard_tab, text="Live State", padding=10)
-        live_frame.pack(fill=tk.X, pady=(10, 0))
-
-        live_grid = ttk.Frame(live_frame)
+        live_grid = ttk.Frame(live_card.body, style="Card.TFrame")
         live_grid.pack(fill=tk.X)
-        live_grid.columnconfigure(0, weight=1)
-        live_grid.columnconfigure(1, weight=1)
+        live_grid.columnconfigure(0, weight=1, uniform="live")
+        live_grid.columnconfigure(1, weight=1, uniform="live")
 
-        metrics_card = ttk.LabelFrame(live_grid, text="Telemetry", padding=8)
-        metrics_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        prediction_card = ttk.LabelFrame(live_grid, text="Inference", padding=8)
-        prediction_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        metrics_panel = RoundedCard(
+            live_grid,
+            title="System",
+            radius=13,
+            surface=SURFACE_ALT,
+            outside=SURFACE,
+            border=BORDER,
+            content_style="Inset.TFrame",
+            title_style="InsetTitle.TLabel",
+            subtitle_style="Muted.Inset.TLabel",
+            padding=(6, 5),
+        )
+        metrics_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        prediction_panel = RoundedCard(
+            live_grid,
+            title="Prediction",
+            radius=13,
+            surface=SURFACE_ALT,
+            outside=SURFACE,
+            border=BORDER,
+            content_style="Inset.TFrame",
+            title_style="InsetTitle.TLabel",
+            subtitle_style="Muted.Inset.TLabel",
+            padding=(6, 5),
+        )
+        prediction_panel.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
 
         ttk.Label(
-            metrics_card,
+            metrics_panel.body,
             textvariable=self.metrics_var,
             justify=tk.LEFT,
-            wraplength=420,
+            wraplength=360,
+            style="Inset.TLabel",
         ).pack(anchor="w", fill=tk.X)
         ttk.Label(
-            prediction_card,
+            prediction_panel.body,
             textvariable=self.prediction_var,
             justify=tk.LEFT,
-            wraplength=420,
+            wraplength=360,
+            style="Inset.TLabel",
         ).pack(anchor="w", fill=tk.X)
 
-        meter_frame = ttk.Frame(live_frame)
-        meter_frame.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Label(meter_frame, text="Confidence").grid(row=0, column=0, sticky="w")
+        meter_frame = ttk.Frame(live_card.body, style="Card.TFrame")
+        meter_frame.pack(fill=tk.X, pady=(16, 0))
+        ttk.Label(
+            meter_frame,
+            text="Confidence",
+            style="Card.TLabel",
+        ).grid(row=0, column=0, sticky="w")
         self.confidence_bar = ttk.Progressbar(
             meter_frame,
             orient="horizontal",
@@ -509,14 +409,18 @@ class DemoApp:
             variable=self.confidence_var,
             length=260,
         )
-        self.confidence_bar.grid(row=0, column=1, padx=(8, 8), sticky="ew")
-        ttk.Label(meter_frame, textvariable=self.confidence_text_var).grid(
-            row=0,
-            column=2,
-            sticky="w",
-        )
+        self.confidence_bar.grid(row=0, column=1, padx=(10, 10), sticky="ew")
+        ttk.Label(
+            meter_frame,
+            textvariable=self.confidence_text_var,
+            style="Card.TLabel",
+        ).grid(row=0, column=2, sticky="w")
 
-        ttk.Label(meter_frame, text="Stability").grid(row=1, column=0, sticky="w")
+        ttk.Label(
+            meter_frame,
+            text="Stability",
+            style="Card.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.stability_bar = ttk.Progressbar(
             meter_frame,
             orient="horizontal",
@@ -525,410 +429,131 @@ class DemoApp:
             variable=self.stability_var,
             length=260,
         )
-        self.stability_bar.grid(row=1, column=1, padx=(8, 8), sticky="ew")
-        ttk.Label(meter_frame, textvariable=self.stability_text_var).grid(
+        self.stability_bar.grid(
             row=1,
-            column=2,
-            sticky="w",
+            column=1,
+            padx=(10, 10),
+            pady=(10, 0),
+            sticky="ew",
         )
+        ttk.Label(
+            meter_frame,
+            textvariable=self.stability_text_var,
+            style="Card.TLabel",
+        ).grid(row=1, column=2, sticky="w", pady=(10, 0))
         meter_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(
+        quick_actions = RoundedCard(
             dashboard_tab,
-            text="Live state is foregrounded; diagnostics stay tucked away in their own tab.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(10, 0))
-
-        quick_actions = ttk.LabelFrame(controls_tab, text="Quick Actions", padding=10)
-        quick_actions.pack(fill=tk.X)
-        ttk.Button(quick_actions, text="Start", command=self.start).pack(
-            side=tk.LEFT, padx=(0, 6)
+            title="Monitor",
         )
-        ttk.Button(quick_actions, text="Stop", command=self.stop).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Checkbutton(
-            quick_actions,
-            text="Dry Run (no oracle call)",
-            variable=self.dry_run_var,
+        quick_actions.pack(fill=tk.X, pady=(14, 0))
+        RoundedButton(
+            quick_actions.body,
+            text="Start monitoring",
+            command=self.start,
+            variant="primary",
+            canvas_bg=SURFACE,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        RoundedButton(
+            quick_actions.body,
+            text="Stop",
+            command=self.stop,
+            canvas_bg=SURFACE,
         ).pack(side=tk.LEFT, padx=(0, 14))
-
-        manual_controls = ttk.LabelFrame(controls_tab, text="Manual Override", padding=10)
-        manual_controls.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(manual_controls, text="Manual:").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            manual_controls,
-            text="Silent",
-            command=lambda: self.manual_set("silent"),
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            manual_controls,
-            text="Balanced",
-            command=lambda: self.manual_set("balanced"),
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            manual_controls,
-            text="Performance",
-            command=lambda: self.manual_set("performance"),
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            manual_controls,
-            text="Resume Auto",
-            command=self.clear_manual_override,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
         ttk.Label(
-            controls_tab,
-            text="Manual override pauses automatic switching until Resume Auto. Dry Run previews behavior without backend writes.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(10, 0))
-
-        settings_frame = ttk.LabelFrame(settings_tab, text="Settings", padding=10)
-        settings_frame.pack(fill=tk.BOTH, expand=True)
-
-        settings_status_row = ttk.Frame(settings_frame)
-        settings_status_row.pack(fill=tk.X)
-        settings_status_row.columnconfigure(0, weight=1)
-        settings_status_row.columnconfigure(1, weight=1)
-        settings_status_row.columnconfigure(2, weight=1)
-
-        file_status_card = ttk.LabelFrame(settings_status_row, text="Config File", padding=8)
-        file_status_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        mapping_status_card = ttk.LabelFrame(settings_status_row, text="Coverage", padding=8)
-        mapping_status_card.grid(row=0, column=1, sticky="nsew", padx=6)
-        validation_card = ttk.LabelFrame(settings_status_row, text="Validation", padding=8)
-        validation_card.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
-
-        ttk.Label(file_status_card, textvariable=self.config_var, justify=tk.LEFT, wraplength=300).pack(anchor="w", fill=tk.X)
-        ttk.Label(file_status_card, textvariable=self.path_status_var, justify=tk.LEFT, wraplength=300).pack(anchor="w", fill=tk.X, pady=(4, 0))
-        ttk.Label(mapping_status_card, textvariable=self.hotkey_status_var, justify=tk.LEFT, wraplength=300).pack(anchor="w", fill=tk.X)
+            quick_actions.body,
+            text="Recommendations only",
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.LEFT, padx=(14, 0))
         ttk.Label(
-            mapping_status_card,
-            textvariable=self.mapping_status_var,
-            justify=tk.LEFT,
-            wraplength=300,
-        ).pack(anchor="w", fill=tk.X, pady=(4, 0))
-        ttk.Label(
-            validation_card,
-            textvariable=self.validation_status_var,
-            justify=tk.LEFT,
-            wraplength=300,
-        ).pack(anchor="w", fill=tk.X)
-        tk.Label(
-            settings_frame,
-            textvariable=self.settings_error_var,
-            fg="#9b0000",
-            anchor="w",
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(8, 0))
+            quick_actions.body,
+            textvariable=self.status_var,
+            style="Muted.Card.TLabel",
+        ).pack(side=tk.RIGHT)
 
-        config_help_frame = ttk.LabelFrame(settings_frame, text="Config Workflow", padding=8)
-        config_help_frame.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(
-            config_help_frame,
-            text="Apply = session only · Save = write current form to disk · Reload = read from disk · Reset = restore built-in defaults",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X)
-        ttk.Label(
-            config_help_frame,
-            text="After a dry-run probe, use tune_probe_config.py to generate evidence-based threshold suggestions.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(
-            config_help_frame,
-            text="Before retraining, use analyze_training_data.py to spot weak label/session/power-saver coverage.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(4, 0))
-
-        config_path_row = ttk.Frame(settings_frame)
-        config_path_row.pack(fill=tk.X, pady=(8, 8))
-        ttk.Label(config_path_row, text="Config Path").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(config_path_row, textvariable=self.config_path_var).pack(
-            side=tk.LEFT,
-            fill=tk.X,
-            expand=True,
-            padx=(0, 6),
+        observation_card = RoundedCard(
+            dashboard_tab,
+            title="Observation",
+            subtitle="Read-only policy outcome tracking for the current session.",
         )
-        ttk.Button(
-            config_path_row,
-            text="Browse",
-            command=self._browse_config_path,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            config_path_row,
-            text="Use Default",
-            command=self._reset_config_path,
-        ).pack(side=tk.LEFT)
-
-        columns = ttk.Frame(settings_frame)
-        columns.pack(fill=tk.BOTH, expand=True)
-        columns.columnconfigure(0, weight=1)
-        columns.columnconfigure(1, weight=1)
-
-        left_col = ttk.Frame(columns)
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        right_col = ttk.Frame(columns)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-
-        thresholds = ttk.LabelFrame(
-            left_col,
-            text="Switching Thresholds",
-            padding=8,
-        )
-        thresholds.pack(fill=tk.X, pady=(0, 8))
-        thresholds.columnconfigure(2, weight=1)
-
+        observation_card.pack(fill=tk.X, pady=(14, 0))
         ttk.Label(
-            thresholds,
-            text="Use typical ranges for stable demos; you can still tune outside them.",
+            observation_card.body,
+            textvariable=self.observation_phase_var,
+            style="Card.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            observation_card.body,
+            textvariable=self.observation_status_var,
             justify=tk.LEFT,
-            wraplength=420,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            wraplength=900,
+            style="Muted.Card.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
-        for row, key in enumerate(self.threshold_order, start=1):
-            spec = self.threshold_specs[key]
-            ttk.Label(thresholds, text=spec["label"]).grid(
-                row=row,
-                column=0,
-                sticky="w",
-                padx=(0, 8),
-                pady=3,
-            )
-            ttk.Entry(
-                thresholds,
-                textvariable=spec["var"],
-                width=14,
-            ).grid(row=row, column=1, sticky="w", pady=3)
-            status_label = tk.Label(
-                thresholds,
-                textvariable=self.threshold_status_vars[key],
-                anchor="w",
+        if self.debug_mode:
+            diagnostics_tab = ttk.Frame(notebook, padding=(4, 18))
+            notebook.add(diagnostics_tab, text="Diagnostics")
+            ttk.Label(
+                diagnostics_tab,
+                textvariable=self.backend_info_var,
                 justify=tk.LEFT,
-                fg="#475569",
+                wraplength=900,
+            ).pack(fill=tk.X, pady=(0, 8))
+
+            diagnostics_card = RoundedCard(
+                diagnostics_tab,
+                title="Diagnostics log",
+                subtitle="Filter runtime events while debugging model and backend behavior.",
             )
-            status_label.grid(row=row, column=2, sticky="w", padx=(10, 0), pady=3)
-            self.threshold_status_labels[key] = status_label
+            diagnostics_card.pack(fill=tk.BOTH, expand=True)
+            log_controls = ttk.Frame(diagnostics_card.body, style="Card.TFrame")
+            log_controls.pack(fill=tk.X, pady=(0, 10))
+            ttk.Label(
+                log_controls,
+                text="View",
+                style="Card.TLabel",
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Combobox(
+                log_controls,
+                textvariable=self.log_filter_var,
+                values=["All", "Switches", "Warnings"],
+                width=12,
+                state="readonly",
+            ).pack(side=tk.LEFT)
+            RoundedButton(
+                log_controls,
+                text="Clear",
+                command=self._clear_log,
+                canvas_bg=SURFACE,
+            ).pack(side=tk.LEFT, padx=(8, 0))
 
-        hotkeys_frame = ttk.LabelFrame(
-            left_col,
-            text="Profile Hotkeys",
-            padding=8,
-        )
-        hotkeys_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(
-            hotkeys_frame,
-            text="Blank is OK for oracle-backed switching.",
-            justify=tk.LEFT,
-            wraplength=420,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-        for row, profile in enumerate(VALID_PROFILES, start=1):
-            ttk.Label(hotkeys_frame, text=profile).grid(
-                row=row,
-                column=0,
-                sticky="w",
-                padx=(0, 8),
-                pady=2,
+            self.log_filter_var.trace_add(
+                "write",
+                lambda *_: self._refresh_log_view(),
             )
-            ttk.Entry(
-                hotkeys_frame,
-                textvariable=self.hotkey_vars[profile],
-                width=28,
-            ).grid(row=row, column=1, sticky="w", pady=2)
+            self.log_box = tk.Text(
+                diagnostics_card.body,
+                height=16,
+                wrap="word",
+                background="#f1f3f4",
+                foreground=MUTED,
+                insertbackground=MUTED,
+                selectbackground="#d2e3fc",
+                relief=tk.FLAT,
+                borderwidth=0,
+                padx=12,
+                pady=10,
+                font=("Cascadia Mono", 9),
+            )
+            self.log_box.pack(fill=tk.BOTH, expand=True)
+            self.log_box.configure(state=tk.DISABLED)
 
-        mapping_frame = ttk.LabelFrame(
-            right_col,
-            text="Label to Profile Mapping",
-            padding=8,
+        self.power_plans_editor = PowerPlansEditor(
+            power_plans_tab,
+            on_log=self.log,
         )
-        mapping_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        add_map = ttk.Frame(mapping_frame)
-        add_map.pack(fill=tk.X)
-        ttk.Label(add_map, text="New Label").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Entry(add_map, textvariable=self.new_label_var, width=18).pack(
-            side=tk.LEFT,
-            padx=(0, 6),
-        )
-        ttk.Button(add_map, text="Add", command=self._add_label_mapping).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(
-            add_map,
-            text="Import Model Labels",
-            command=self._import_model_labels,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Label(
-            mapping_frame,
-            text="Import classes.json to prefill mappings before you start the live demo.",
-            justify=tk.LEFT,
-            wraplength=420,
-        ).pack(fill=tk.X, pady=(8, 0))
-
-        mapping_tools = ttk.Frame(mapping_frame)
-        mapping_tools.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(mapping_tools, text="Filter").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Entry(mapping_tools, textvariable=self.mapping_filter_var, width=18).pack(
-            side=tk.LEFT,
-            padx=(0, 6),
-        )
-        ttk.Button(
-            mapping_tools,
-            text="Clear",
-            command=self._clear_mapping_filter,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(mapping_tools, text="Bulk").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Combobox(
-            mapping_tools,
-            textvariable=self.bulk_profile_var,
-            values=list(VALID_PROFILES),
-            state="readonly",
-            width=12,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            mapping_tools,
-            text="Apply to Visible",
-            command=self._apply_bulk_profile_to_visible,
-        ).pack(side=tk.LEFT)
-
-        ttk.Label(
-            mapping_frame,
-            textvariable=self.mapping_filter_status_var,
-            justify=tk.LEFT,
-            wraplength=420,
-        ).pack(fill=tk.X, pady=(6, 0))
-
-        mapping_list_frame = ttk.Frame(mapping_frame)
-        mapping_list_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-
-        self.mapping_canvas = tk.Canvas(
-            mapping_list_frame,
-            height=220,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        mapping_scrollbar = ttk.Scrollbar(
-            mapping_list_frame,
-            orient="vertical",
-            command=self.mapping_canvas.yview,
-        )
-        self.mapping_rows_frame = ttk.Frame(self.mapping_canvas)
-        self.mapping_canvas_window = self.mapping_canvas.create_window(
-            (0, 0),
-            window=self.mapping_rows_frame,
-            anchor="nw",
-        )
-        self.mapping_canvas.configure(yscrollcommand=mapping_scrollbar.set)
-        self.mapping_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        mapping_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.mapping_rows_frame.bind(
-            "<Configure>",
-            lambda _e: self.mapping_canvas.configure(
-                scrollregion=self.mapping_canvas.bbox("all")
-            ),
-        )
-        self.mapping_canvas.bind(
-            "<Configure>",
-            lambda e: self.mapping_canvas.itemconfigure(
-                self.mapping_canvas_window,
-                width=e.width,
-            ),
-        )
-
-        actions_row = ttk.Frame(settings_frame)
-        actions_row.pack(fill=tk.X, pady=(8, 0))
-        actions_row.columnconfigure(0, weight=1)
-        actions_row.columnconfigure(1, weight=1)
-
-        file_actions = ttk.LabelFrame(actions_row, text="File Actions", padding=8)
-        file_actions.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        preset_actions = ttk.LabelFrame(actions_row, text="Session Presets", padding=8)
-        preset_actions.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-
-        self.apply_settings_button = ttk.Button(
-            file_actions,
-            text="Apply Session",
-            command=self.apply_settings_session,
-        )
-        self.apply_settings_button.pack(side=tk.LEFT, padx=(0, 6))
-        self.save_settings_button = ttk.Button(
-            file_actions,
-            text="Save",
-            command=self.save_settings_file,
-        )
-        self.save_settings_button.pack(side=tk.LEFT, padx=(0, 6))
-        self.reload_settings_button = ttk.Button(
-            file_actions,
-            text="Reload",
-            command=self.reload_settings_file,
-        )
-        self.reload_settings_button.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            file_actions,
-            text="Reset Defaults",
-            command=self.reset_settings_defaults,
-        ).pack(side=tk.LEFT)
-
-        for preset_name in PRESET_SWITCHING:
-            ttk.Button(
-                preset_actions,
-                text=preset_name,
-                command=lambda n=preset_name: self._apply_preset(n),
-            ).pack(side=tk.LEFT, padx=(0, 4))
-
-        ttk.Label(
-            settings_frame,
-            text="Presets change the current session immediately. Use Save to persist them to disk.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(8, 0))
-
-        ttk.Label(
-            log_tab,
-            text="Diagnostics are available when you need them, but kept visually out of the main demo flow.",
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(
-            log_tab,
-            textvariable=self.backend_info_var,
-            justify=tk.LEFT,
-            wraplength=900,
-        ).pack(fill=tk.X, pady=(0, 8))
-
-        log_frame = ttk.LabelFrame(log_tab, text="Diagnostics Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        log_controls = ttk.Frame(log_frame)
-        log_controls.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(log_controls, text="View").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Combobox(
-            log_controls,
-            textvariable=self.log_filter_var,
-            values=["All", "Switches", "Warnings"],
-            width=12,
-            state="readonly",
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            log_controls,
-            text="Clear",
-            command=self._clear_log,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-        self.log_filter_var.trace_add("write", lambda *_: self._refresh_log_view())
-
-        self.log_box = tk.Text(log_frame, height=16, wrap="word")
-        self.log_box.pack(fill=tk.BOTH, expand=True)
-        self.log_box.configure(state=tk.DISABLED)
-
-        self._render_label_mapping_rows()
+        self.power_plans_editor.pack(fill=tk.BOTH, expand=True)
         self._update_backend_info()
 
     def _set_settings_error(self, message: str):
@@ -1096,38 +721,19 @@ class DemoApp:
                 f"{self._short_path(path)}"
             )
 
-    @staticmethod
-    def _set_badge(widget: tk.Label, text: str, bg: str, fg: str = "white"):
-        widget.configure(
-            text=text,
-            bg=bg,
-            fg=fg,
-            relief="ridge",
-            bd=1,
-            font=("Segoe UI", 9, "bold"),
-        )
-
     def _update_dashboard_badges(self):
         mode_text = "Mode MANUAL" if self.manual_override else "Mode AUTO"
-        mode_color = "#d97706" if self.manual_override else "#2563eb"
         self.mode_badge_var.set(mode_text)
-        self._set_badge(self.mode_badge, mode_text, mode_color)
 
         execution_text = "Exec DRY RUN" if self.dry_run_var.get() else "Exec LIVE"
-        execution_color = "#7c3aed" if self.dry_run_var.get() else "#15803d"
         self.execution_badge_var.set(execution_text)
-        self._set_badge(self.execution_badge, execution_text, execution_color)
 
         config_text = "Config UNSAVED" if self._settings_dirty else "Config SAVED"
-        config_color = "#b45309" if self._settings_dirty else "#15803d"
         self.config_badge_var.set(config_text)
-        self._set_badge(self.config_badge, config_text, config_color)
 
         model_ready = bool(self.classes)
         model_text = "Model READY" if model_ready else "Model MISSING"
-        model_color = "#15803d" if model_ready else "#6b7280"
         self.model_badge_var.set(model_text)
-        self._set_badge(self.model_badge, model_text, model_color)
 
     def _update_config_summary(self):
         s = self.runtime_config.switching
@@ -1277,11 +883,11 @@ class DemoApp:
         if self.classes:
             labels = ", ".join(self.classes)
             self.model_info_var.set(
-                f"{MODEL_FILE} | classes: {labels}"
+                f"{MODEL_FILE} | classes: {labels} | normalized runtime bundle"
             )
         else:
             self.model_info_var.set(
-                f"waiting for {MODEL_FILE} and {CLASSES_FILE}"
+                f"waiting for {MODEL_FILE}, {CLASSES_FILE}, and model_metadata.json"
             )
         self._update_mapping_status()
         self._update_dashboard_badges()
@@ -1327,7 +933,7 @@ class DemoApp:
                 "Mappings: model classes missing explicit entries -> " + ", ".join(sorted(missing))
             )
             self.health_var.set(
-                "model loaded, but some classes still rely on default mappings; review Configuration"
+                "model loaded, but some classes still rely on legacy default profile mappings"
             )
         else:
             self.mapping_status_var.set(
@@ -1449,6 +1055,13 @@ class DemoApp:
         )
 
     def _render_label_mapping_rows(self):
+        if not hasattr(self, "mapping_rows_frame"):
+            labels = self._get_filtered_mapping_labels()
+            self._refresh_mapping_filter_status(
+                labels,
+                len(self.label_map_vars),
+            )
+            return
         for child in self.mapping_rows_frame.winfo_children():
             child.destroy()
 
@@ -1810,8 +1423,6 @@ class DemoApp:
 
     def _filter_allows(self, level: str) -> bool:
         filt = self.log_filter_var.get()
-        if filt == "All":
-            return True
         if filt == "Switches":
             return level == "switch"
         if filt == "Warnings":
@@ -1819,6 +1430,8 @@ class DemoApp:
         return True
 
     def _refresh_log_view(self):
+        if self.log_box is None:
+            return
         self.log_box.configure(state=tk.NORMAL)
         self.log_box.delete("1.0", tk.END)
         for level, line in self.log_entries:
@@ -1829,7 +1442,6 @@ class DemoApp:
 
     def _clear_log(self):
         self.log_entries.clear()
-        self._refresh_log_view()
         self.log("log cleared")
 
     def log(self, message: str, level: str = "info"):
@@ -1858,20 +1470,14 @@ class DemoApp:
         ix = self.feature_index
         cpu = x[ix["Total CPU Usage [%]"]]
         ram = x[ix["RAM Usage [%]"]]
+        gpu = x[ix["GPU Usage [%]"]]
         battery = x[ix["On Battery [0/1]"]]
-        saver = x[ix["Power Saver [0/1]"]]
         disk_r = x[ix["Disk Read [MB/s]"]]
-        disk_w = x[ix["Disk Write [MB/s]"]]
         net_d = x[ix["Network Down [KB/s]"]]
-        net_u = x[ix["Network Up [KB/s]"]]
         return (
-            "System: "
-            f"CPU {cpu:4.1f}% | RAM {ram:4.1f}% | "
-            f"Battery {'ON' if battery >= 0.5 else 'OFF'} | "
-            f"Saver {'ON' if saver >= 0.5 else 'OFF'}\n"
-            "Throughput: "
-            f"Disk R {disk_r:5.2f} MB/s | Disk W {disk_w:5.2f} MB/s | "
-            f"Net D {net_d:6.1f} KB/s | Net U {net_u:6.1f} KB/s"
+            f"CPU {cpu:.1f}%  ·  GPU {gpu:.1f}%  ·  RAM {ram:.1f}%\n"
+            f"Disk {disk_r:.1f} MB/s  ·  Network {net_d:.0f} KB/s  ·  "
+            f"{'Battery' if battery >= 0.5 else 'Plugged in'}"
         )
 
     def _set_status(self, text: str):
@@ -1926,7 +1532,7 @@ class DemoApp:
         if self.running:
             return
         try:
-            self.model, self.classes = load_model_and_classes()
+            self.model, self.classes, self.model_bundle = load_model_and_classes()
             self.model.to(self.device)
             self._update_model_info()
         except Exception as e:
@@ -1947,7 +1553,7 @@ class DemoApp:
         self.prediction_smoother.reset()
         self._set_status("running")
         self._set_gate_status("warming up model signal")
-        self._set_last_action("session started; waiting for first switch")
+        self._set_last_action("monitoring started; waiting for a recommendation")
         self._set_live_summary(target_profile="-", confident=False)
         self.log("demo started")
 
@@ -1960,7 +1566,7 @@ class DemoApp:
         self.running = False
         self._set_status("stopped")
         self._set_gate_status("stopped")
-        self._set_last_action("session stopped")
+        self._set_last_action("monitoring stopped")
         self._set_live_summary(target_profile=str(self.current_profile or "-"), confident=False)
         self.log("demo stopped")
 
@@ -2020,14 +1626,17 @@ class DemoApp:
         try:
             switching = self.runtime_config.switching
 
-            x = get_telemetry()
+            if self.model_bundle is None:
+                raise RuntimeError("Model bundle not loaded.")
+
+            raw_x = get_telemetry()
+            x = normalize_features(raw_x, self.model_bundle)
             x_t = torch.from_numpy(x).unsqueeze(0).to(self.device)
 
             with torch.inference_mode():
                 logits = self.model(x_t)
                 probs = F.softmax(logits, dim=1)
 
-            raw_summary = summarize_probabilities(probs[0], self.classes)
             decision_probs = self.prediction_smoother.update(probs[0])
             decision_summary = summarize_probabilities(decision_probs, self.classes)
 
@@ -2050,68 +1659,32 @@ class DemoApp:
                 self.last_candidate = None
                 self.stable_count = 0
 
-            target_profile = (
-                self.manual_override
-                if self.manual_override is not None
-                else profile_for_label(
-                    pred_label,
-                    label_map=self.runtime_config.label_to_profile,
+            active_catalog = (
+                self.power_plans_editor.state.catalog
+                if hasattr(self, "power_plans_editor")
+                else self.plan_catalog
+            )
+            target_plan_id = active_catalog.classification_to_plan.get(
+                pred_label.strip().lower()
+            )
+            if target_plan_id not in active_catalog.plans:
+                target_plan_id = next(
+                    (
+                        plan_id
+                        for plan_id, plan in active_catalog.plans.items()
+                        if plan.enabled
+                    ),
+                    next(iter(active_catalog.plans)),
                 )
-            )
-            now_ts = time.time()
-            gate = evaluate_switch_gate(
-                current_profile=self.current_profile,
-                target_profile=target_profile,
-                confident=confident,
-                stable_count=self.stable_count,
-                base_window=switching.stability_window,
-                downshift_extra_window=switching.downshift_extra_window,
-                now_ts=now_ts,
-                last_switch_ts=self.last_switch_ts,
-                min_switch_interval_sec=switching.min_switch_interval_sec,
-                downshift_hold_sec=switching.downshift_hold_sec,
-            )
-            if self.manual_override is not None:
-                self._set_gate_status("manual override active")
+            target_plan_name = active_catalog.plans[target_plan_id].name
+            required_stability = switching.stability_window
+            if not confident:
+                gate_text = "waiting for confidence"
+            elif self.stable_count < required_stability:
+                gate_text = f"stabilizing {self.stable_count}/{required_stability}"
             else:
-                gate_text = describe_gate(gate)
-                self._set_gate_status(gate_text)
-                self._record_gate_observation(gate.reason)
-            switched = False
-
-            if self.manual_override is None and gate.allow:
-                result = self.oracle.set_profile(
-                    target_profile,
-                    dry_run=self.dry_run_var.get(),
-                )
-                if result.ok:
-                    self.current_profile = result.applied_profile or target_profile
-                    self._auto_switch_count += 1
-                    action_text = (
-                        f"auto switch -> {self.current_profile} ({gate.direction}, conf {confidence:.2f})"
-                        f" | {self._describe_apply_result(result)}"
-                    )
-                    if result.message:
-                        action_text += f" | {result.message}"
-                    self._set_last_action(action_text)
-                    self.log(
-                        f"switch label={pred_label} -> profile={self.current_profile} "
-                        f"(confidence={confidence:.2f}, gate={gate.direction})",
-                        level="switch",
-                    )
-                else:
-                    self._failed_switch_count += 1
-                    action_text = f"auto switch failed -> {target_profile} ({gate.direction})"
-                    if result.message:
-                        action_text += f" | {result.message}"
-                    self._set_last_action(action_text)
-                    self.log(
-                        f"switch failed label={pred_label} -> profile={target_profile}: "
-                        f"{result.message}",
-                        level="warn",
-                    )
-                switched = True
-                self.last_switch_ts = now_ts
+                gate_text = "recommendation ready"
+            self._set_gate_status(gate_text)
 
             self.metrics_var.set(self._format_metrics(x))
             stability_text = self._format_stability_display(
@@ -2119,32 +1692,90 @@ class DemoApp:
                 switching.stability_window,
             )
             self.prediction_var.set(
-                f"Raw: {raw_summary.label} ({raw_summary.confidence:.2f})\n"
-                f"Decision: {pred_label} ({confidence:.2f}) | Margin {margin:.2f} | "
-                f"Reliable {confident} | Stability {stability_text}"
+                f"{pred_label.title()}  ·  {confidence * 100.0:.0f}% confidence\n"
+                f"{target_plan_name}  ·  Stability {stability_text}"
             )
             self._update_live_meters(
                 confidence,
                 self.stable_count,
-                gate.required_stability,
+                required_stability,
             )
-            self._set_profile_line(target=target_profile)
+            self._set_profile_line(target=target_plan_id)
             self._set_live_summary(
                 pred_label=pred_label,
                 confidence=confidence,
                 margin=margin,
-                target_profile=target_profile,
+                target_profile=target_plan_id,
                 confident=confident,
                 stable_count=self.stable_count,
-                window=gate.required_stability,
+                window=required_stability,
             )
 
+            runtime_context = get_runtime_context()
+            power_source_text = (
+                "battery"
+                if runtime_context.battery_plugged is False
+                else "AC"
+                if runtime_context.battery_plugged is True
+                else "unknown"
+            )
+            throughput_mb_s = (
+                float(raw_x[self.feature_index["Disk Read [MB/s]"]])
+                + float(raw_x[self.feature_index["Disk Write [MB/s]"]])
+                + (
+                    float(raw_x[self.feature_index["Network Down [KB/s]"]])
+                    + float(raw_x[self.feature_index["Network Up [KB/s]"]])
+                )
+                / 1024.0
+            )
+            snapshot = TelemetrySnapshot(
+                captured_at=runtime_context.captured_at,
+                predicted_label=pred_label,
+                plan_id=target_plan_id,
+                confidence=confidence,
+                on_battery=bool(runtime_context.battery_plugged is False),
+                power_source=power_source_text,
+                battery_percent=runtime_context.battery_percent,
+                battery_drain_pct_per_hour=runtime_context.battery_drain_pct_per_hour,
+                cpu_usage_pct=float(raw_x[self.feature_index["Total CPU Usage [%]"]]),
+                gpu_usage_pct=float(raw_x[self.feature_index["GPU Usage [%]"]]),
+                throughput_mb_s=throughput_mb_s,
+                manual_override=self.manual_override,
+            )
+            completed_window = self.observation_tracker.observe(snapshot)
+            phase = self.observation_tracker.phase()
+            self.observation_phase_var.set(f"phase={phase}")
+            battery_text = (
+                f"{runtime_context.battery_percent:.1f}%"
+                if runtime_context.battery_percent is not None
+                else "unknown"
+            )
+            drain_text = (
+                f"{runtime_context.battery_drain_pct_per_hour:.2f}%/h"
+                if runtime_context.battery_drain_pct_per_hour is not None
+                else "n/a"
+            )
+            if completed_window is not None:
+                outcome = self.observation_tracker.summarize(completed_window)
+                self.observation_status_var.set(
+                    f"battery={battery_text} | drain={drain_text} | "
+                    f"window={completed_window.predicted_label}->{completed_window.plan_id} "
+                    f"score={outcome.score:.1f} helped={outcome.helped}"
+                )
+            else:
+                self.observation_status_var.set(
+                    f"battery={battery_text} | drain={drain_text} | "
+                    f"plan={runtime_context.active_power_plan} | "
+                    f"power={power_source_text} | "
+                    f"throughput={throughput_mb_s:.2f} MB/s"
+                )
+
             self.tick_count += 1
-            if self.tick_count % 8 == 0 and not switched:
+            if self.tick_count % 8 == 0:
                 self.log(
                     f"tick label={pred_label} conf={confidence:.2f} "
-                    f"stable={self._format_stability_display(self.stable_count, gate.required_stability)} "
-                    f"gate={describe_gate(gate)} mode={'MANUAL' if self.manual_override else 'AUTO'}"
+                    f"stable={self._format_stability_display(self.stable_count, required_stability)} "
+                    f"plan={target_plan_id} status={gate_text}"
                 )
 
         except Exception as e:

@@ -10,55 +10,18 @@ Optional shared backend path:
     - this lets controller use the same command/powercfg/oracle backend flow as the demo GUI and probe tools
 """
 
-import json
 import os
 import time
-from pathlib import Path
 
 import keyboard  # global hotkeys; may require admin on Windows
 import torch
 import torch.nn.functional as F
 
 from config import CONFIG_FILE, load_config
-from model import SystemStateNet
-from monitor import get_telemetry, FEATURE_NAMES
+from model_artifacts import load_model_artifacts, normalize_features
 from oracle_client import OracleClient, profile_for_label
 from prediction_logic import ProbabilitySmoother, summarize_probabilities
 from switch_policy import describe_gate, evaluate_switch_gate
-
-MODEL_FILE = "model.pth"
-CLASSES_FILE = "classes.json"
-
-def load_model():
-    model_path = Path(MODEL_FILE)
-    classes_path = Path(CLASSES_FILE)
-    if not model_path.exists() or not classes_path.exists():
-        raise RuntimeError(
-            "Missing model artifacts. Expected both "
-            f"'{MODEL_FILE}' and '{CLASSES_FILE}'. "
-            "Run train_model.py after collecting training_data.csv."
-        )
-
-    with open(CLASSES_FILE, "r", encoding="utf-8") as f:
-        classes = json.load(f)
-    if not classes:
-        raise RuntimeError(f"'{CLASSES_FILE}' is empty; retrain the model.")
-
-    input_dim = len(FEATURE_NAMES)
-    num_classes = len(classes)
-
-    model = SystemStateNet(input_dim, num_classes)
-    state = torch.load(MODEL_FILE, map_location="cpu")
-    try:
-        model.load_state_dict(state)
-    except RuntimeError as e:
-        raise RuntimeError(
-            "Model/feature schema mismatch. Re-record data and re-run train_model.py."
-        ) from e
-    model.eval()
-
-    return model, classes
-
 
 def send_profile_hotkey(profile: str, profile_hotkeys: dict[str, str]) -> bool:
     combo = profile_hotkeys.get(profile.strip().lower())
@@ -104,7 +67,9 @@ def main_loop():
     cfg = cfg_result.config
     print(f"[CONFIG] Loaded: {cfg_result.source}")
 
-    model, classes = load_model()
+    bundle = load_model_artifacts()
+    model = bundle.model
+    classes = bundle.classes
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -124,7 +89,7 @@ def main_loop():
 
     try:
         while True:
-            x = get_telemetry()
+            x = normalize_features(get_telemetry(), bundle)
             x_t = torch.from_numpy(x).unsqueeze(0).to(device)  # shape (1, feat_dim)
 
             with torch.inference_mode():

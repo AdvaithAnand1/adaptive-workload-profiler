@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-06-14T00:00:00Z",
+  "rules": {
+    "browser": {
+      "rule_id": "browser",
+      "label": "browsing",
+      "display_name": "Browsers",
+      "executable_names": [
+        "chrome.exe",
+        "msedge.exe",
+        "opera.exe",
+        "firefox.exe",
+        "brave.exe"
+      ],
+      "path_contains": [
+        "chrome",
+        "edge",
+        "opera",
+        "firefox",
+        "brave"
+      ],
+      "notes": "General browser workloads stay in the browsing category.",
+      "enabled": true
+    },
+    "office": {
+      "rule_id": "office",
+      "label": "office",
+      "display_name": "Office Apps",
+      "executable_names": [
+        "winword.exe",
+        "excel.exe",
+        "powerpnt.exe",
+        "outlook.exe",
+        "libreoffice.exe",
+        "soffice.bin"
+      ],
+      "path_contains": [
+        "office",
+        "microsoft office",
+        "libreoffice",
+        "soffice"
+      ],
+      "notes": "Office suites and document editors map to office-style workloads.",
+      "enabled": true
+    },
+    "media": {
+      "rule_id": "media",
+      "label": "media",
+      "display_name": "Media Players",
+      "executable_names": [
+        "vlc.exe",
+        "spotify.exe",
+        "wmplayer.exe",
+        "mpc-hc64.exe",
+        "mpv.exe"
+      ],
+      "path_contains": [
+        "vlc",
+        "spotify",
+        "media player",
+        "mpv"
+      ],
+      "notes": "Media playback and audio-only sessions map to media.",
+      "enabled": true
+    },
+    "lunar": {
+      "rule_id": "lunar",
+      "label": "gaming",
+      "display_name": "Lunar Client",
+      "executable_names": [
+        "lunar client.exe",
+        "lunarclient.exe",
+        "javaw.exe"
+      ],
+      "path_contains": [
+        "lunar",
+        "lunarclient"
+      ],
+      "parent_names": [
+        "lunar client",
+        "lunarclient",
+        "lunar client launcher"
+      ],
+      "command_line_markers": [
+        "-jar",
+        "lunar"
+      ],
+      "notes": "Generic javaw.exe must not match without Lunar-specific process context.",
+      "enabled": true
+    },
+    "dev": {
+      "rule_id": "dev",
+      "label": "rendering",
+      "display_name": "Developer Tools",
+      "executable_names": [
+        "code.exe",
+        "devenv.exe",
+        "idea64.exe",
+        "pycharm64.exe",
+        "clion64.exe",
+        "java.exe",
+        "javaw.exe"
+      ],
+      "path_contains": [
+        "visual studio",
+        "jetbrains",
+        "vscode",
+        "code",
+        "intellij",
+        "pycharm"
+      ],
+      "notes": "Developer tools are conservative stand-ins for heavier mixed workloads.",
+      "enabled": true
+    }
+  }
+}

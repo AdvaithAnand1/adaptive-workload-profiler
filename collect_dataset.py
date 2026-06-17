@@ -4,7 +4,7 @@ Collect a full labeled dataset in one command.
 Examples:
     python collect_dataset.py
     python collect_dataset.py --sessions idle:120,light:180,heavy:240
-    python collect_dataset.py --interval 0.25 --out training_data.csv --cycles 2
+    python collect_dataset.py --interval 0.25 --data-dir data --cycles 2
 """
 
 from __future__ import annotations
@@ -77,13 +77,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--out",
-        default="training_data.csv",
-        help="Output CSV path (default: training_data.csv)",
+        default=None,
+        help="Optional legacy combined CSV path.",
+    )
+    p.add_argument(
+        "--data-dir",
+        default="data",
+        help="Session dataset root used when --out is omitted (default: data).",
     )
     p.add_argument(
         "--reset",
         action="store_true",
-        help="Delete output CSV before collection starts.",
+        help="Delete the explicit --out CSV before collection starts.",
     )
     p.add_argument(
         "--countdown",
@@ -117,11 +122,13 @@ def main():
 
     base_sessions = _parse_sessions(args.sessions)
     sessions = base_sessions * args.cycles
-    out_path = Path(args.out)
+    out_path = Path(args.out) if args.out else None
 
-    if args.reset and out_path.exists():
+    if args.reset and out_path is None:
+        raise ValueError("--reset requires an explicit --out file")
+    if args.reset and out_path is not None and out_path.exists():
         out_path.unlink()
-        print(f"Deleted existing dataset: '{args.out}'")
+        print(f"Deleted existing dataset: '{out_path}'")
 
     print("Dataset collection plan:")
     if args.cycles > 1:
@@ -142,6 +149,7 @@ def main():
             out_csv=args.out,
             interval=args.interval,
             duration=duration,
+            data_dir=args.data_dir,
         )
 
         if i < total and args.cooldown > 0:
@@ -154,7 +162,8 @@ def main():
         else:
             os.environ["PERFANALYZE_MOCK_LABEL"] = prior_mock_label
 
-    print(f"\nFinished. Dataset saved to '{args.out}'.")
+    destination = str(out_path) if out_path else str(Path(args.data_dir))
+    print(f"\nFinished. Dataset saved under '{destination}'.")
 
 
 if __name__ == "__main__":

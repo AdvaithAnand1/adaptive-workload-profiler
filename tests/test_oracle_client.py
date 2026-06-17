@@ -72,6 +72,17 @@ Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)
         )
         self.assertEqual(token, "custom-guid")
 
+    def test_powercfg_fallback_aliases_match_windows_semantics(self):
+        self.assertEqual(powercfg_target_for_profile("silent", []), "SCHEME_MAX")
+        self.assertEqual(
+            powercfg_target_for_profile("balanced", []),
+            "SCHEME_BALANCED",
+        )
+        self.assertEqual(
+            powercfg_target_for_profile("performance", []),
+            "SCHEME_MIN",
+        )
+
     def test_resolve_powercfg_target_token_matches_scheme_name(self):
         schemes = parse_powercfg_list(
             "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced) *"
